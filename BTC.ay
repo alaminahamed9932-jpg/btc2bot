@@ -1,0 +1,205 @@
+from flask import Flask, render_template_string, request
+import requests
+import numpy as np
+import datetime
+import time
+
+app = Flask(__name__)
+
+# ==============================
+# 🔐 SAFE REQUEST
+# ==============================
+def safe_request(url):
+    try:
+        res = requests.get(url, timeout=5)
+        return res.json()
+    except:
+        return None
+
+# ==============================
+# 📡 GET DATA (RETRY)
+# ==============================
+def get_klines(interval="15m", limit=200):
+    url = f"https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval={interval}&limit={limit}"
+
+    for _ in range(3):
+        data = safe_request(url)
+        if data:
+            close = np.array([float(x[4]) for x in data])
+            high = np.array([float(x[2]) for x in data])
+            low = np.array([float(x[3]) for x in data])
+            volume = np.array([float(x[5]) for x in data])
+            return close, high, low, volume
+        time.sleep(1)
+
+    return None, None, None, None
+
+# ==============================
+# 📊 INDICATORS
+# ==============================
+def vwap(close, volume):
+    return np.sum(close * volume) / np.sum(volume)
+
+def atr(high, low, close, period=14):
+    tr = []
+    for i in range(1, len(close)):
+        tr.append(max(
+            high[i] - low[i],
+            abs(high[i] - close[i-1]),
+            abs(low[i] - close[i-1])
+        ))
+    return np.mean(tr[-period:])
+
+# ==============================
+# 🧠 SMC LOGIC
+# ==============================
+def structure(close):
+    return "bullish" if close[-1] > close[-10] else "bearish"
+
+def liquidity(high, low):
+    if high[-1] > max(high[-10:-1]):
+        return "buy_sweep"
+    elif low[-1] < min(low[-10:-1]):
+        return "sell_sweep"
+    return None
+
+def fvg(high, low):
+    for i in range(len(high)-1, 2, -1):
+        if low[i] > high[i-2]:
+            return "bullish"
+        elif high[i] < low[i-2]:
+            return "bearish"
+    return None
+
+def order_block(close, high, low):
+    for i in range(len(close)-5, 2, -1):
+        if close[i] < close[i-1] and close[i+1] > high[i]:
+            return "bullish"
+        elif close[i] > close[i-1] and close[i+1] < low[i]:
+            return "bearish"
+    return None
+
+# ==============================
+# 🎯 ENTRY SYSTEM
+# ==============================
+def trade_levels(close, high, low, atr_val, signal):
+    price = close[-1]
+    recent_high = max(high[-10:])
+    recent_low = min(low[-10:])
+    buffer = atr_val * 0.5
+
+    if signal == "LONG":
+        sl = recent_low - buffer
+        risk = price - sl
+        tp1 = price + risk
+        tp2 = price + risk * 2
+
+    elif signal == "SHORT":
+        sl = recent_high + buffer
+        risk = sl - price
+        tp1 = price - risk
+        tp2 = price - risk * 2
+
+    else:
+        return None
+
+    return price, sl, tp1, tp2
+
+# ==============================
+# 🚫 RANGE FILTER
+# ==============================
+def is_range(close):
+    return (max(close[-20:]) - min(close[-20:])) < close[-1] * 0.003
+
+# ==============================
+# 🚀 SIGNAL ENGINE
+# ==============================
+def generate_signal():
+
+    close, high, low, volume = get_klines()
+
+    if close is None:
+        return {"error": "DATA ERROR"}
+
+    if is_range(close):
+        return {"signal": "NO TRADE", "reason": "Range Market"}
+
+    price = close[-1]
+    vw = vwap(close, volume)
+    at = atr(high, low, close)
+
+    struct = structure(close)
+    liq = liquidity(high, low)
+    gap = fvg(high, low)
+    ob = order_block(close, high, low)
+
+    score = 0
+    score += 20 if struct == "bullish" else -20
+    score += 20 if liq == "sell_sweep" else -20 if liq == "buy_sweep" else 0
+    score += 10 if gap == "bullish" else -10 if gap == "bearish" else 0
+    score += 10 if ob == "bullish" else -10 if ob == "bearish" else 0
+    score += 10 if price > vw else -10
+
+    setup = (liq is not None) and (gap or ob)
+
+    if abs(score) < 30 or not setup:
+        return {"signal": "NO TRADE", "reason": "Weak Setup"}
+
+    signal = "LONG" if score > 0 else "SHORT"
+
+    entry, sl, tp1, tp2 = trade_levels(close, high, low, at, signal)
+    confidence = min(100, 50 + score)
+
+    return {
+        "signal": signal,
+        "confidence": confidence,
+        "price": round(price,2),
+        "entry": round(entry,2),
+        "sl": round(sl,2),
+        "tp1": round(tp1,2),
+        "tp2": round(tp2,2),
+        "structure": struct,
+        "liquidity": liq,
+        "fvg": gap,
+        "ob": ob
+    }
+
+# ==============================
+# 🌐 UI
+# ==============================
+@app.route("/")
+def home():
+
+    run = request.args.get("run")
+    data = None
+
+    if run:
+        data = generate_signal()
+
+    now = datetime.datetime.utcnow().strftime("%H:%M:%S")
+
+    return render_template_string("""
+    <html>
+    <body style="background:#0d1117;color:white;text-align:center;">
+    <h1>🚀 BTC BOT</h1>
+    <p>{{time}}</p>
+
+    <a href="/?run=1"><button>Generate Signal</button></a>
+
+    {% if data %}
+    <h2>{{data.signal}}</h2>
+    <p>Confidence: {{data.confidence}}%</p>
+    <p>Entry: {{data.entry}}</p>
+    <p>SL: {{data.sl}}</p>
+    <p>TP1: {{data.tp1}}</p>
+    {% endif %}
+
+    </body>
+    </html>
+    """, data=data, time=now)
+
+# ==============================
+# ▶️ RUN
+# ==============================
+if __name__ == "__main__":
+    app.run()
